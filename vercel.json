@@ -1,6 +1,0 @@
-{
-  "name": "ticker-proxy",
-  "type": "module",
-  "engines": { "node": "22.x" },
-  "dependencies": {}
-}
