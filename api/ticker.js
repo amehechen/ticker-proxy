@@ -104,6 +104,14 @@ async function fetchFinnhub(symbols) {
   return { data: out, error: errs.length ? errs.join(",") : null };
 }
 
+// If any requested id still has no price, reuse last good per-id snapshot
+for (const id of ids) {
+  if (!merged[id]?.price && lastGoodById[id]?.price != null) {
+    merged[id] = { ...lastGoodById[id], source: merged[id]?.source || "snapshot-id" };
+    errors.push(`used-last-good:${id}`);
+  }
+}
+
 // Stooq robusto para ^GSPC: probar mirrors + símbolos alternativos
 async function fetchStooqSPXRobust() {
   const hosts = ["https://stooq.com", "https://stooq.pl"];
