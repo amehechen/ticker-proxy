@@ -1,11 +1,12 @@
-// Aggregador robusto (Node handler) con deadline y snapshot en memoria.
-// Fuentes: Twelve Data (stocks), Stooq (^SPX), CoinGecko (BTC/ETH), CriptoYa (USDARS).
+// Aggregador robusto (Node handler) con deadline, snapshot y fallback Finnhub para stocks.
+// Fuentes: Twelve Data (stocks primario), Finnhub (stocks fallback), Stooq (^SPX), CoinGecko (BTC/ETH), CriptoYa (USDARS).
 
 const TD_TOKEN = process.env.TWELVE_DATA_TOKEN;
+const FH_TOKEN = process.env.FINNHUB_TOKEN;
 
-// ---- Parámetros de resiliencia (AUMENTADOS)
-const PER_SOURCE_TIMEOUT_MS = 3000;   // antes 1200
-const GLOBAL_DEADLINE_MS     = 3500;  // antes 1700
+// ---- Parámetros de resiliencia (amplios)
+const PER_SOURCE_TIMEOUT_MS = 3000;
+const GLOBAL_DEADLINE_MS     = 3500;
 const CDN_SMAXAGE_SEC        = 5;
 const CDN_STALE_SEC          = 20;
 
@@ -32,7 +33,9 @@ async function fetchWithTimeout(url, init = {}, ms = PER_SOURCE_TIMEOUT_MS) {
   finally { clearTimeout(t); }
 }
 
-// Twelve Data
+// ---------- Fetchers
+
+// Twelve Data (batch)
 async function fetchTwelveData(symbols) {
   if (!TD_TOKEN || !symbols.length) return { data: {}, error: "twelve-no-token-or-empty" };
   const url = `https://api.twelvedata.com/quote?symbol=${symbols.join(",")}&apikey=${TD_TOKEN}`;
@@ -51,8 +54,9 @@ async function fetchTwelveData(symbols) {
             source: "twelvedata",
           };
         } else if (q?.status) {
-          // devolver el error del símbolo también
-          return { data: out, error: `twelve-${sym}-${q.status}` };
+          // guardamos el error por símbolo
+          out[sym] = out[sym] || {};
+          out[sym].__error = `twelve-${sym}-${q.status}`;
         }
       }
     } else if (raw?.symbol) {
@@ -68,7 +72,33 @@ async function fetchTwelveData(symbols) {
   }
 }
 
-// Stooq
+// Finnhub (fallback por símbolo: quote)
+async function fetchFinnhub(symbols) {
+  if (!FH_TOKEN || !symbols.length) return { data: {}, error: "finnhub-no-token-or-empty" };
+  const out = {};
+  const errs = [];
+  // hacemos requests en paralelo pero con timeout por cada una
+  await Promise.all(symbols.map(async (sym) => {
+    const url = `https://finnhub.io/api/v1/quote?symbol=${sym}&token=${FH_TOKEN}`;
+    try {
+      const res = await fetchWithTimeout(url, { headers: { accept: "application/json" } });
+      if (!res.ok) { errs.push(`fh-http-${sym}-${res.status}`); return; }
+      const j = await res.json();
+      const price = num(j.c);
+      const prev  = num(j.pc);
+      if (price != null) {
+        out[sym] = { price, prevClose: prev, source: "finnhub" };
+      } else {
+        errs.push(`fh-empty-${sym}`);
+      }
+    } catch (e) {
+      errs.push(`fh-ex-${sym}-${(e && e.name) || "err"}`);
+    }
+  }));
+  return { data: out, error: errs.length ? errs.join(",") : null };
+}
+
+// Stooq (^SPX en puntos)
 async function fetchStooqSPX() {
   const url = "https://stooq.com/q/l/?s=%5Espx&i=d";
   try {
@@ -84,7 +114,7 @@ async function fetchStooqSPX() {
   }
 }
 
-// CoinGecko
+// CoinGecko (BTC/ETH %24h)
 async function fetchCoinGecko(ids) {
   const need = [];
   if (ids.includes("BTC")) need.push("bitcoin");
@@ -104,7 +134,7 @@ async function fetchCoinGecko(ids) {
   }
 }
 
-// CriptoYa
+// CriptoYa (USDARS)
 async function fetchCriptoYa() {
   const url = "https://criptoya.com/api/dolar";
   try {
@@ -123,6 +153,7 @@ async function fetchCriptoYa() {
   }
 }
 
+// ---------- Ensamblado
 function mapItem(id, raw) {
   const meta = {
     BTC:    { label: "Bitcoin",      kind: "crypto", currency: "USD" },
@@ -164,17 +195,20 @@ function mapItem(id, raw) {
   };
 }
 
+// ---------- Handler
 export default async function handler(req, res) {
   if (req.method === "OPTIONS") return sendJson(res, 200, { ok: true });
 
   const start = Date.now();
-  const debug = (req.url || "").includes("debug=1"); // agrega ?debug=1 a la URL para ver detalles
+  const debug = (req.url || "").includes("debug=1");
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const raw = (url.searchParams.get("items") || "").trim();
     if (!raw) return sendJson(res, 400, { ok: false, error: "missing items" });
 
     const ids = raw.split(",").map(s => decodeURIComponent(s.trim())).filter(Boolean);
+
+    // Qué quiere cada fuente
     const wantTD  = ids.filter((s) => /^[A-Z.]+$/.test(s) && !["BTC","ETH","OFICIAL","BLUE","MEP","^GSPC"].includes(s));
     const wantCG  = ids.filter((s) => s === "BTC" || s === "ETH");
     const wantCY  = ids.some((s) => s === "OFICIAL" || s === "BLUE" || s === "MEP");
@@ -184,6 +218,7 @@ export default async function handler(req, res) {
     const errors = [];
     const sources = [];
 
+    // Primero Twelve Data para stocks
     if (wantTD.length) { jobs.push(fetchTwelveData(wantTD)); sources.push({ name:"twelvedata", wants: wantTD }); }
     if (wantCG.length) { jobs.push(fetchCoinGecko(wantCG));  sources.push({ name:"coingecko", wants: wantCG }); }
     if (wantCY)        { jobs.push(fetchCriptoYa());         sources.push({ name:"criptoya", wants: ["OFICIAL","BLUE","MEP"] }); }
@@ -209,6 +244,15 @@ export default async function handler(req, res) {
       }
     } catch (e) {
       errors.push(String(e?.message || e));
+    }
+
+    // Fallback Finnhub para símbolos que sigan sin precio
+    const missingStockIds = wantTD.filter((sym) => !merged[sym]?.price);
+    if (missingStockIds.length && FH_TOKEN) {
+      const fh = await fetchFinnhub(missingStockIds);
+      if (fh.error) errors.push(fh.error);
+      merged = Object.assign(merged, fh.data);
+      sources.push({ name: "finnhub-fallback", wants: missingStockIds });
     }
 
     const items = ids.map((id) => mapItem(id, merged[id] || {}));
