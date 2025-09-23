@@ -1,32 +1,31 @@
-// Aggregador robusto con deadline y snapshot en memoria (sin dependencias).
+// Aggregador robusto (Node handler) con deadline y snapshot en memoria.
+// Siempre responde: datos actuales, parciales o último snapshot (stale).
 // Fuentes: Twelve Data (stocks), Stooq (^SPX), CoinGecko (BTC/ETH), CriptoYa (USDARS).
-// Siempre responde: datos actuales, parciales o último snapshot (stale), con CORS.
 
 const TD_TOKEN = process.env.TWELVE_DATA_TOKEN;
 
 // ---- Parámetros de resiliencia
 const PER_SOURCE_TIMEOUT_MS = 1200;   // timeout por proveedor
 const GLOBAL_DEADLINE_MS     = 1700;  // deadline total por request
-const CDN_SMAXAGE_SEC        = 5;     // cache CDN corto
+const CDN_SMAXAGE_SEC        = 5;     // cache CDN corto (CDN de Vercel)
 const CDN_STALE_SEC          = 20;
 
 let lastGoodSnapshot = null; // { ok, ts, items, meta }
 let lastGoodAt = 0;
 
-// ---- Utils
-const ok = (data, status = 200) =>
-  new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      "access-control-allow-origin": "*",
-      "access-control-allow-methods": "GET, OPTIONS",
-      "access-control-allow-headers": "Content-Type",
-      "cache-control": `public, s-maxage=${CDN_SMAXAGE_SEC}, stale-while-revalidate=${CDN_STALE_SEC}, max-age=0`
-    },
-  });
-
-const bad = (msg, status = 400) => ok({ ok: false, error: msg }, status);
+// ---- Utils (Node-style res)
+function sendJson(res, status, data) {
+  res.statusCode = status;
+  res.setHeader("content-type", "application/json; charset=utf-8");
+  res.setHeader("access-control-allow-origin", "*");
+  res.setHeader("access-control-allow-methods", "GET, OPTIONS");
+  res.setHeader("access-control-allow-headers", "Content-Type");
+  res.setHeader(
+    "cache-control",
+    `public, s-maxage=${CDN_SMAXAGE_SEC}, stale-while-revalidate=${CDN_STALE_SEC}, max-age=0`
+  );
+  res.end(JSON.stringify(data));
+}
 
 const num = (x) => {
   const n = Number(x);
@@ -166,19 +165,21 @@ function mapItem(id, raw) {
   };
 }
 
-// ---- Handler con deadline global y snapshot
-export default async function handler(req) {
-  if (req.method === "OPTIONS") return ok({ ok: true });
+// ---- Handler (Node-style) con deadline global + snapshot
+export default async function handler(req, res) {
+  if (req.method === "OPTIONS") {
+    return sendJson(res, 200, { ok: true });
+  }
 
   const start = Date.now();
   try {
-    const url = new URL(req.url);
+    const url = new URL(req.url, `http://${req.headers.host}`);
     const raw = (url.searchParams.get("items") || "").trim();
-    if (!raw) return bad("missing items", 400);
+    if (!raw) return sendJson(res, 400, { ok: false, error: "missing items" });
 
     const ids = raw.split(",").map(s => decodeURIComponent(s.trim())).filter(Boolean);
 
-    // Clasificamos
+    // Clasificamos intereses por fuente
     const wantTD  = ids.filter((s) => /^[A-Z.]+$/.test(s) && !["BTC","ETH","OFICIAL","BLUE","MEP","^GSPC"].includes(s));
     const wantCG  = ids.filter((s) => s === "BTC" || s === "ETH");
     const wantCY  = ids.some((s) => s === "OFICIAL" || s === "BLUE" || s === "MEP");
@@ -230,7 +231,7 @@ export default async function handler(req) {
     if (!hasAnyPrice && lastGoodSnapshot) {
       const snap = { ...lastGoodSnapshot };
       snap.meta = { ...(snap.meta || {}), servedFrom: "snapshot", snapshotAt: lastGoodAt };
-      return ok(snap);
+      return sendJson(res, 200, snap);
     }
 
     const partial = items.some((it) => it.price == null);
@@ -246,13 +247,13 @@ export default async function handler(req) {
       lastGoodAt = Date.now();
     }
 
-    return ok(payload);
+    return sendJson(res, 200, payload);
   } catch (e) {
     if (lastGoodSnapshot) {
       const snap = { ...lastGoodSnapshot };
       snap.meta = { ...(snap.meta || {}), servedFrom: "snapshot-on-error", error: String(e?.message || e) };
-      return ok(snap);
+      return sendJson(res, 200, snap);
     }
-    return ok({ ok: true, ts: Date.now(), items: [], meta: { partial: true, stale: true, errors: [String(e?.message || e)] } });
+    return sendJson(res, 200, { ok: true, ts: Date.now(), items: [], meta: { partial: true, stale: true, errors: [String(e?.message || e)] } });
   }
 }
