@@ -1,17 +1,22 @@
-// Aggregador robusto (Node handler) con deadline, snapshot y fallback Finnhub para stocks.
-// Fuentes: Twelve Data (stocks primario), Finnhub (stocks fallback), Stooq (^SPX), CoinGecko (BTC/ETH), CriptoYa (USDARS).
+// Aggregador robusto con deadline, snapshot en memoria, fallbacks y mirrors.
+// Fuentes:
+// - Stocks: Twelve Data (primario) + Finnhub (fallback por símbolo)
+// - Índice S&P 500: Stooq con mirrors/símbolos alternativos + fallback a último valor bueno
+// - Cripto: CoinGecko (primario) + CoinCap (fallback), %24h
+// - FX ARS: CriptoYa (oficial/blue/mep)
 
 const TD_TOKEN = process.env.TWELVE_DATA_TOKEN;
 const FH_TOKEN = process.env.FINNHUB_TOKEN;
 
-// ---- Parámetros de resiliencia (amplios)
+// ---------- Resiliencia / caché CDN
 const PER_SOURCE_TIMEOUT_MS = 3000;
-const GLOBAL_DEADLINE_MS     = 3500;
-const CDN_SMAXAGE_SEC        = 5;
-const CDN_STALE_SEC          = 20;
+const GLOBAL_DEADLINE_MS = 3500;
+const CDN_SMAXAGE_SEC = 5;
+const CDN_STALE_SEC = 20;
 
-let lastGoodSnapshot = null;
+let lastGoodSnapshot = null;      // snapshot whole payload
 let lastGoodAt = 0;
+let lastGoodById = {};            // { id: { price, prevClose, source, ts } } item-level memory
 
 function sendJson(res, status, data) {
   res.statusCode = status;
@@ -19,7 +24,10 @@ function sendJson(res, status, data) {
   res.setHeader("access-control-allow-origin", "*");
   res.setHeader("access-control-allow-methods", "GET, OPTIONS");
   res.setHeader("access-control-allow-headers", "Content-Type");
-  res.setHeader("cache-control", `public, s-maxage=${CDN_SMAXAGE_SEC}, stale-while-revalidate=${CDN_STALE_SEC}, max-age=0`);
+  res.setHeader(
+    "cache-control",
+    `public, s-maxage=${CDN_SMAXAGE_SEC}, stale-while-revalidate=${CDN_STALE_SEC}, max-age=0`
+  );
   res.end(JSON.stringify(data));
 }
 
@@ -54,7 +62,6 @@ async function fetchTwelveData(symbols) {
             source: "twelvedata",
           };
         } else if (q?.status) {
-          // guardamos el error por símbolo
           out[sym] = out[sym] || {};
           out[sym].__error = `twelve-${sym}-${q.status}`;
         }
@@ -72,12 +79,11 @@ async function fetchTwelveData(symbols) {
   }
 }
 
-// Finnhub (fallback por símbolo: quote)
+// Finnhub (fallback por símbolo)
 async function fetchFinnhub(symbols) {
   if (!FH_TOKEN || !symbols.length) return { data: {}, error: "finnhub-no-token-or-empty" };
   const out = {};
   const errs = [];
-  // hacemos requests en paralelo pero con timeout por cada una
   await Promise.all(symbols.map(async (sym) => {
     const url = `https://finnhub.io/api/v1/quote?symbol=${sym}&token=${FH_TOKEN}`;
     try {
@@ -85,7 +91,7 @@ async function fetchFinnhub(symbols) {
       if (!res.ok) { errs.push(`fh-http-${sym}-${res.status}`); return; }
       const j = await res.json();
       const price = num(j.c);
-      const prev  = num(j.pc);
+      const prev = num(j.pc);
       if (price != null) {
         out[sym] = { price, prevClose: prev, source: "finnhub" };
       } else {
@@ -98,43 +104,94 @@ async function fetchFinnhub(symbols) {
   return { data: out, error: errs.length ? errs.join(",") : null };
 }
 
-// Stooq (^SPX en puntos)
-async function fetchStooqSPX() {
-  const url = "https://stooq.com/q/l/?s=%5Espx&i=d";
-  try {
-    const res = await fetchWithTimeout(url, { headers: { accept: "text/plain" } });
-    if (!res.ok) return { data: {}, error: `stooq-http-${res.status}` };
-    const txt = await res.text();
-    const parts = (txt.trim().split("\n")[0] || "").split(",");
-    const close = num(parts[6]);
-    if (!Number.isFinite(close)) return { data: {}, error: "stooq-parse" };
-    return { data: { "^GSPC": { price: close, prevClose: null, source: "stooq" } }, error: null };
-  } catch (e) {
-    return { data: {}, error: `stooq-ex-${(e && e.name) || "err"}` };
+// Stooq robusto para ^GSPC: probar mirrors + símbolos alternativos
+async function fetchStooqSPXRobust() {
+  const hosts = ["https://stooq.com", "https://stooq.pl"];
+  const syms = ["%5Espx", "%5Egspc", "spx"]; // ^spx, ^gspc o spx
+  const headers = { accept: "text/plain" };
+
+  for (const h of hosts) {
+    for (const s of syms) {
+      const url = `${h}/q/l/?s=${s}&i=d`;
+      try {
+        const res = await fetchWithTimeout(url, { headers });
+        if (!res.ok) continue;
+        const txt = await res.text();
+        const line = (txt.trim().split("\n")[0] || "");
+        const parts = line.split(",");
+        // Stooq CSV: [symbol, date, time, open, high, low, close, volume, ...]
+        const close = num(parts[6]);
+        if (Number.isFinite(close)) {
+          return { data: { "^GSPC": { price: close, prevClose: null, source: "stooq" } }, error: null };
+        }
+      } catch (_) { /* try next */ }
+    }
   }
+  return { data: {}, error: "stooq-all-attempts-failed" };
 }
 
-// CoinGecko (BTC/ETH %24h)
-async function fetchCoinGecko(ids) {
-  const need = [];
-  if (ids.includes("BTC")) need.push("bitcoin");
-  if (ids.includes("ETH")) need.push("ethereum");
-  if (!need.length) return { data: {}, error: null };
-  const url = `https://api.coingecko.com/api/v3/simple/price?ids=${need.join(",")}&vs_currencies=usd&include_24hr_change=true`;
-  try {
-    const res = await fetchWithTimeout(url, { headers: { accept: "application/json" } });
-    if (!res.ok) return { data: {}, error: `cg-http-${res.status}` };
-    const j = await res.json();
-    const out = {};
-    if (j.bitcoin)  out["BTC"] =  { price: num(j.bitcoin.usd),   changePct24h: num(j.bitcoin.usd_24h_change),   source: "coingecko" };
-    if (j.ethereum) out["ETH"] =  { price: num(j.ethereum.usd),  changePct24h: num(j.ethereum.usd_24h_change),  source: "coingecko" };
-    return { data: out, error: null };
-  } catch (e) {
-    return { data: {}, error: `cg-ex-${(e && e.name) || "err"}` };
+// CoinGecko (primario) → CoinCap (fallback) para BTC/ETH
+async function fetchCryptoWithFallback(ids) {
+  const out = {};
+  const errs = [];
+
+  // 1) CoinGecko
+  const cgNeed = [];
+  if (ids.includes("BTC")) cgNeed.push("bitcoin");
+  if (ids.includes("ETH")) cgNeed.push("ethereum");
+
+  let triedCG = false;
+  if (cgNeed.length) {
+    const cgUrl = `https://api.coingecko.com/api/v3/simple/price?ids=${cgNeed.join(",")}&vs_currencies=usd&include_24hr_change=true`;
+    triedCG = true;
+    try {
+      const res = await fetchWithTimeout(cgUrl, { headers: { accept: "application/json" } });
+      if (res.ok) {
+        const j = await res.json();
+        if (j.bitcoin)  out["BTC"] = { price: num(j.bitcoin.usd),  changePct24h: num(j.bitcoin.usd_24h_change),  source: "coingecko" };
+        if (j.ethereum) out["ETH"] = { price: num(j.ethereum.usd), changePct24h: num(j.ethereum.usd_24h_change), source: "coingecko" };
+      } else {
+        errs.push(`cg-http-${res.status}`);
+      }
+    } catch (e) {
+      errs.push(`cg-ex-${(e && e.name) || "err"}`);
+    }
   }
+
+  // 2) Si faltó algo o CG dio 429/err → CoinCap
+  const needFallback = ids.filter((id) => !out[id]);
+  if (needFallback.length) {
+    try {
+      const ccUrl = `https://api.coincap.io/v2/assets?ids=${needFallback.map(x => x === "BTC" ? "bitcoin" : x === "ETH" ? "ethereum" : "").filter(Boolean).join(",")}`;
+      const res = await fetchWithTimeout(ccUrl, { headers: { accept: "application/json" } });
+      if (res.ok) {
+        const j = await res.json();
+        const arr = Array.isArray(j?.data) ? j.data : [];
+        for (const a of arr) {
+          if (a.id === "bitcoin") {
+            const price = num(a.priceUsd);
+            const pct = num(a.changePercent24Hr);
+            if (price != null) out["BTC"] = { price, changePct24h: pct, source: "coincap" };
+          }
+          if (a.id === "ethereum") {
+            const price = num(a.priceUsd);
+            const pct = num(a.changePercent24Hr);
+            if (price != null) out["ETH"] = { price, changePct24h: pct, source: "coincap" };
+          }
+        }
+        if (!arr.length) errs.push("coincap-empty");
+      } else {
+        errs.push(`coincap-http-${res.status}`);
+      }
+    } catch (e) {
+      errs.push(`coincap-ex-${(e && e.name) || "err"}`);
+    }
+  }
+
+  return { data: out, error: errs.length ? errs.join(",") : null };
 }
 
-// CriptoYa (USDARS)
+// CriptoYa (dólar ARS)
 async function fetchCriptoYa() {
   const url = "https://criptoya.com/api/dolar";
   try {
@@ -144,26 +201,27 @@ async function fetchCriptoYa() {
     const pick = (n) => num(n?.price ?? n?.ask ?? n?.bid);
     const out = {};
     if (d.oficial) out["OFICIAL"] = { price: pick(d.oficial), changePct: num(d.oficial.variation), source: "criptoya" };
-    if (d.blue)   out["BLUE"]   = { price: pick(d.blue),    changePct: num(d.blue.variation),    source: "criptoya" };
+    if (d.blue)   out["BLUE"]   = { price: pick(d.blue),      changePct: num(d.blue.variation),   source: "criptoya" };
     const mep = d?.mep?.gd30?.ci;
-    if (mep)      out["MEP"]    = { price: num(mep.price),  changePct: num(mep.variation),       source: "criptoya" };
+    if (mep)      out["MEP"]    = { price: num(mep.price),    changePct: num(mep.variation),      source: "criptoya" };
     return { data: out, error: null };
   } catch (e) {
     return { data: {}, error: `cy-ex-${(e && e.name) || "err"}` };
   }
 }
 
-// ---------- Ensamblado
+// ---------- Ensamblado / mapping
+
 function mapItem(id, raw) {
   const meta = {
-    BTC:    { label: "Bitcoin",      kind: "crypto", currency: "USD" },
-    ETH:    { label: "Ethereum",     kind: "crypto", currency: "USD" },
-    OFICIAL:{ label: "Dólar Oficial",kind: "fx_ars", currency: "ARS" },
-    BLUE:   { label: "Dólar Blue",   kind: "fx_ars", currency: "ARS" },
-    MEP:    { label: "Dólar MEP",    kind: "fx_ars", currency: "ARS" },
-    "^GSPC":{ label: "S&P 500",      kind: "index",  currency: "USD" },
-    NVDA:   { label: "Nvidia",       kind: "stock",  currency: "USD" },
-    PLTR:   { label: "Palantir",     kind: "stock",  currency: "USD" },
+    BTC:    { label: "Bitcoin",       kind: "crypto", currency: "USD" },
+    ETH:    { label: "Ethereum",      kind: "crypto", currency: "USD" },
+    OFICIAL:{ label: "Dólar Oficial", kind: "fx_ars", currency: "ARS" },
+    BLUE:   { label: "Dólar Blue",    kind: "fx_ars", currency: "ARS" },
+    MEP:    { label: "Dólar MEP",     kind: "fx_ars", currency: "ARS" },
+    "^GSPC":{ label: "S&P 500",       kind: "index",  currency: "USD" },
+    NVDA:   { label: "Nvidia",        kind: "stock",  currency: "USD" },
+    PLTR:   { label: "Palantir",      kind: "stock",  currency: "USD" },
   }[id] || { label: id, kind: "stock", currency: "USD" };
 
   let changeAbs = null, changePct = null, direction = "flat";
@@ -181,6 +239,7 @@ function mapItem(id, raw) {
       changeAbs = raw.price != null ? raw.price - raw.prevClose : null;
     }
   }
+
   return {
     id,
     label: meta.label,
@@ -196,11 +255,13 @@ function mapItem(id, raw) {
 }
 
 // ---------- Handler
+
 export default async function handler(req, res) {
   if (req.method === "OPTIONS") return sendJson(res, 200, { ok: true });
 
   const start = Date.now();
   const debug = (req.url || "").includes("debug=1");
+
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const raw = (url.searchParams.get("items") || "").trim();
@@ -209,26 +270,29 @@ export default async function handler(req, res) {
     const ids = raw.split(",").map(s => decodeURIComponent(s.trim())).filter(Boolean);
 
     // Qué quiere cada fuente
-    const wantTD  = ids.filter((s) => /^[A-Z.]+$/.test(s) && !["BTC","ETH","OFICIAL","BLUE","MEP","^GSPC"].includes(s));
-    const wantCG  = ids.filter((s) => s === "BTC" || s === "ETH");
-    const wantCY  = ids.some((s) => s === "OFICIAL" || s === "BLUE" || s === "MEP");
-    const wantSPX = ids.includes("^GSPC");
+    const wantStocks = ids.filter((s) => /^[A-Z.]+$/.test(s) && !["BTC","ETH","OFICIAL","BLUE","MEP","^GSPC"].includes(s));
+    const wantCrypto = ids.filter((s) => s === "BTC" || s === "ETH");
+    const wantFX    = ids.some((s) => s === "OFICIAL" || s === "BLUE" || s === "MEP");
+    const wantSPX   = ids.includes("^GSPC");
 
     const jobs = [];
     const errors = [];
     const sources = [];
 
-    // Primero Twelve Data para stocks
-    if (wantTD.length) { jobs.push(fetchTwelveData(wantTD)); sources.push({ name:"twelvedata", wants: wantTD }); }
-    if (wantCG.length) { jobs.push(fetchCoinGecko(wantCG));  sources.push({ name:"coingecko", wants: wantCG }); }
-    if (wantCY)        { jobs.push(fetchCriptoYa());         sources.push({ name:"criptoya", wants: ["OFICIAL","BLUE","MEP"] }); }
-    if (wantSPX)       { jobs.push(fetchStooqSPX());         sources.push({ name:"stooq", wants: ["^GSPC"] }); }
+    // Stocks: TwelveData primero
+    if (wantStocks.length) { jobs.push(fetchTwelveData(wantStocks)); sources.push({ name:"twelvedata", wants: wantStocks }); }
+    // Crypto
+    if (wantCrypto.length) { jobs.push(fetchCryptoWithFallback(wantCrypto)); sources.push({ name:"coingecko/coinCap", wants: wantCrypto }); }
+    // FX
+    if (wantFX) { jobs.push(fetchCriptoYa()); sources.push({ name:"criptoya", wants: ["OFICIAL","BLUE","MEP"] }); }
+    // S&P 500
+    if (wantSPX) { jobs.push(fetchStooqSPXRobust()); sources.push({ name:"stooq-robust", wants: ["^GSPC"] }); }
 
-    const globalTimeout = new Promise((_, rej) => setTimeout(() => rej(new Error("global-deadline")), GLOBAL_DEADLINE_MS));
+    const deadline = new Promise((_, rej) => setTimeout(() => rej(new Error("global-deadline")), GLOBAL_DEADLINE_MS));
 
     let merged = {};
     try {
-      const settled = await Promise.race([ Promise.allSettled(jobs), globalTimeout ]);
+      const settled = await Promise.race([ Promise.allSettled(jobs), deadline ]);
       if (Array.isArray(settled)) {
         for (const s of settled) {
           if (s.status === "fulfilled") {
@@ -246,8 +310,8 @@ export default async function handler(req, res) {
       errors.push(String(e?.message || e));
     }
 
-    // Fallback Finnhub para símbolos que sigan sin precio
-    const missingStockIds = wantTD.filter((sym) => !merged[sym]?.price);
+    // Fallback Finnhub para stocks que sigan sin precio
+    const missingStockIds = wantStocks.filter((sym) => !merged[sym]?.price);
     if (missingStockIds.length && FH_TOKEN) {
       const fh = await fetchFinnhub(missingStockIds);
       if (fh.error) errors.push(fh.error);
@@ -255,8 +319,21 @@ export default async function handler(req, res) {
       sources.push({ name: "finnhub-fallback", wants: missingStockIds });
     }
 
+    // Si ^GSPC sigue sin precio, usar último bueno para ese ID
+    if (wantSPX && !merged["^GSPC"]?.price && lastGoodById["^GSPC"]?.price != null) {
+      merged["^GSPC"] = { ...lastGoodById["^GSPC"], source: merged["^GSPC"]?.source || "snapshot-id" };
+      errors.push("spx-used-last-good");
+    }
+
     const items = ids.map((id) => mapItem(id, merged[id] || {}));
     const hasAnyPrice = items.some((it) => it.price != null);
+
+    // Guardar item-level memory
+    for (const it of items) {
+      if (it.price != null) {
+        lastGoodById[it.id] = { price: it.price, prevClose: it.prevClose ?? null, source: it.source, ts: Date.now() };
+      }
+    }
 
     if (!hasAnyPrice && lastGoodSnapshot) {
       const snap = { ...lastGoodSnapshot };
@@ -286,6 +363,11 @@ export default async function handler(req, res) {
       snap.meta = { ...(snap.meta || {}), servedFrom: "snapshot-on-error", error: String(e?.message || e) };
       return sendJson(res, 200, snap);
     }
-    return sendJson(res, 200, { ok: true, ts: Date.now(), items: [], meta: { partial: true, stale: true, errors: [String(e?.message || e)] } });
+    return sendJson(res, 200, {
+      ok: true,
+      ts: Date.now(),
+      items: [],
+      meta: { partial: true, stale: true, errors: [String(e?.message || e)] }
+    });
   }
 }
