@@ -1,6 +1,6 @@
-// Aggregador robusto (sin dependencias) con deadline y snapshot en memoria.
+// Aggregador robusto con deadline y snapshot en memoria (sin dependencias).
 // Fuentes: Twelve Data (stocks), Stooq (^SPX), CoinGecko (BTC/ETH), CriptoYa (USDARS).
-// Siempre responde: datos actuales, parciales o último snapshot (stale).
+// Siempre responde: datos actuales, parciales o último snapshot (stale), con CORS.
 
 const TD_TOKEN = process.env.TWELVE_DATA_TOKEN;
 
@@ -77,7 +77,7 @@ async function fetchTwelveData(symbols) {
   return { data: out, error: null };
 }
 
-// Stooq (^SPX diario)
+// Stooq (^SPX diario en puntos)
 async function fetchStooqSPX() {
   const url = "https://stooq.com/q/l/?s=%5Espx&i=d";
   const res = await fetchWithTimeout(url, { headers: { accept: "text/plain" } });
@@ -166,7 +166,7 @@ function mapItem(id, raw) {
   };
 }
 
-// ---- Handler con deadline global
+// ---- Handler con deadline global y snapshot
 export default async function handler(req) {
   if (req.method === "OPTIONS") return ok({ ok: true });
 
