@@ -1,126 +1,128 @@
 // Aggregador robusto (Node handler) con deadline y snapshot en memoria.
-// Siempre responde: datos actuales, parciales o último snapshot (stale).
 // Fuentes: Twelve Data (stocks), Stooq (^SPX), CoinGecko (BTC/ETH), CriptoYa (USDARS).
 
 const TD_TOKEN = process.env.TWELVE_DATA_TOKEN;
 
-// ---- Parámetros de resiliencia
-const PER_SOURCE_TIMEOUT_MS = 1200;   // timeout por proveedor
-const GLOBAL_DEADLINE_MS     = 1700;  // deadline total por request
-const CDN_SMAXAGE_SEC        = 5;     // cache CDN corto (CDN de Vercel)
+// ---- Parámetros de resiliencia (AUMENTADOS)
+const PER_SOURCE_TIMEOUT_MS = 3000;   // antes 1200
+const GLOBAL_DEADLINE_MS     = 3500;  // antes 1700
+const CDN_SMAXAGE_SEC        = 5;
 const CDN_STALE_SEC          = 20;
 
-let lastGoodSnapshot = null; // { ok, ts, items, meta }
+let lastGoodSnapshot = null;
 let lastGoodAt = 0;
 
-// ---- Utils (Node-style res)
 function sendJson(res, status, data) {
   res.statusCode = status;
   res.setHeader("content-type", "application/json; charset=utf-8");
   res.setHeader("access-control-allow-origin", "*");
   res.setHeader("access-control-allow-methods", "GET, OPTIONS");
   res.setHeader("access-control-allow-headers", "Content-Type");
-  res.setHeader(
-    "cache-control",
-    `public, s-maxage=${CDN_SMAXAGE_SEC}, stale-while-revalidate=${CDN_STALE_SEC}, max-age=0`
-  );
+  res.setHeader("cache-control", `public, s-maxage=${CDN_SMAXAGE_SEC}, stale-while-revalidate=${CDN_STALE_SEC}, max-age=0`);
   res.end(JSON.stringify(data));
 }
 
-const num = (x) => {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : null;
-};
-
+const num = (x) => { const n = Number(x); return Number.isFinite(n) ? n : null; };
 const round = (x, d = 2) => (x == null ? null : Math.round(x * 10 ** d) / 10 ** d);
 
-// Timeout por fetch
 async function fetchWithTimeout(url, init = {}, ms = PER_SOURCE_TIMEOUT_MS) {
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(), ms);
-  try {
-    return await fetch(url, { ...init, signal: ac.signal });
-  } finally {
-    clearTimeout(t);
-  }
+  try { return await fetch(url, { ...init, signal: ac.signal }); }
+  finally { clearTimeout(t); }
 }
 
-// ---- Fetchers
-
-// Twelve Data (lote de símbolos)
+// Twelve Data
 async function fetchTwelveData(symbols) {
-  if (!TD_TOKEN || !symbols.length) return { data: {}, error: "no-token-or-empty" };
-  const url = `https://api.twelvedata.com/quote?symbol=${encodeURIComponent(symbols.join(","))}&apikey=${encodeURIComponent(TD_TOKEN)}`;
-  const res = await fetchWithTimeout(url, { headers: { accept: "application/json" } });
-  if (!res.ok) return { data: {}, error: `twelve-${res.status}` };
-  const raw = await res.json();
-  const out = {};
-  if (raw && typeof raw === "object" && !raw.symbol) {
-    for (const sym of symbols) {
-      const q = raw[sym];
-      if (q?.status === "ok") {
-        out[sym] = {
-          price: num(q.price ?? q.c),
-          prevClose: num(q.previous_close ?? q.pc),
-          source: "twelvedata",
-        };
+  if (!TD_TOKEN || !symbols.length) return { data: {}, error: "twelve-no-token-or-empty" };
+  const url = `https://api.twelvedata.com/quote?symbol=${symbols.join(",")}&apikey=${TD_TOKEN}`;
+  try {
+    const res = await fetchWithTimeout(url, { headers: { accept: "application/json" } });
+    if (!res.ok) return { data: {}, error: `twelve-http-${res.status}` };
+    const raw = await res.json();
+    const out = {};
+    if (raw && typeof raw === "object" && !raw.symbol) {
+      for (const sym of symbols) {
+        const q = raw[sym];
+        if (q?.status === "ok") {
+          out[sym] = {
+            price: num(q.price ?? q.c),
+            prevClose: num(q.previous_close ?? q.pc),
+            source: "twelvedata",
+          };
+        } else if (q?.status) {
+          // devolver el error del símbolo también
+          return { data: out, error: `twelve-${sym}-${q.status}` };
+        }
       }
+    } else if (raw?.symbol) {
+      out[raw.symbol] = {
+        price: num(raw.price ?? raw.c),
+        prevClose: num(raw.previous_close ?? raw.pc),
+        source: "twelvedata",
+      };
     }
-  } else if (raw?.symbol) {
-    out[raw.symbol] = {
-      price: num(raw.price ?? raw.c),
-      prevClose: num(raw.previous_close ?? raw.pc),
-      source: "twelvedata",
-    };
+    return { data: out, error: null };
+  } catch (e) {
+    return { data: {}, error: `twelve-ex-${(e && e.name) || "err"}` };
   }
-  return { data: out, error: null };
 }
 
-// Stooq (^SPX diario en puntos)
+// Stooq
 async function fetchStooqSPX() {
   const url = "https://stooq.com/q/l/?s=%5Espx&i=d";
-  const res = await fetchWithTimeout(url, { headers: { accept: "text/plain" } });
-  if (!res.ok) return { data: {}, error: `stooq-${res.status}` };
-  const txt = await res.text();
-  const parts = (txt.trim().split("\n")[0] || "").split(",");
-  const close = num(parts[6]);
-  if (!Number.isFinite(close)) return { data: {}, error: "stooq-parse" };
-  return { data: { "^GSPC": { price: close, prevClose: null, source: "stooq" } }, error: null };
+  try {
+    const res = await fetchWithTimeout(url, { headers: { accept: "text/plain" } });
+    if (!res.ok) return { data: {}, error: `stooq-http-${res.status}` };
+    const txt = await res.text();
+    const parts = (txt.trim().split("\n")[0] || "").split(",");
+    const close = num(parts[6]);
+    if (!Number.isFinite(close)) return { data: {}, error: "stooq-parse" };
+    return { data: { "^GSPC": { price: close, prevClose: null, source: "stooq" } }, error: null };
+  } catch (e) {
+    return { data: {}, error: `stooq-ex-${(e && e.name) || "err"}` };
+  }
 }
 
-// CoinGecko simple (BTC/ETH con %24h)
+// CoinGecko
 async function fetchCoinGecko(ids) {
   const need = [];
   if (ids.includes("BTC")) need.push("bitcoin");
   if (ids.includes("ETH")) need.push("ethereum");
   if (!need.length) return { data: {}, error: null };
-
   const url = `https://api.coingecko.com/api/v3/simple/price?ids=${need.join(",")}&vs_currencies=usd&include_24hr_change=true`;
-  const res = await fetchWithTimeout(url, { headers: { accept: "application/json" } });
-  if (!res.ok) return { data: {}, error: `cg-${res.status}` };
-  const j = await res.json();
-  const out = {};
-  if (j.bitcoin)  out["BTC"] =  { price: num(j.bitcoin.usd),   changePct24h: num(j.bitcoin.usd_24h_change),   source: "coingecko" };
-  if (j.ethereum) out["ETH"] =  { price: num(j.ethereum.usd),  changePct24h: num(j.ethereum.usd_24h_change),  source: "coingecko" };
-  return { data: out, error: null };
+  try {
+    const res = await fetchWithTimeout(url, { headers: { accept: "application/json" } });
+    if (!res.ok) return { data: {}, error: `cg-http-${res.status}` };
+    const j = await res.json();
+    const out = {};
+    if (j.bitcoin)  out["BTC"] =  { price: num(j.bitcoin.usd),   changePct24h: num(j.bitcoin.usd_24h_change),   source: "coingecko" };
+    if (j.ethereum) out["ETH"] =  { price: num(j.ethereum.usd),  changePct24h: num(j.ethereum.usd_24h_change),  source: "coingecko" };
+    return { data: out, error: null };
+  } catch (e) {
+    return { data: {}, error: `cg-ex-${(e && e.name) || "err"}` };
+  }
 }
 
-// CriptoYa (USDARS)
+// CriptoYa
 async function fetchCriptoYa() {
   const url = "https://criptoya.com/api/dolar";
-  const res = await fetchWithTimeout(url, { headers: { accept: "application/json" } });
-  if (!res.ok) return { data: {}, error: `cy-${res.status}` };
-  const d = await res.json();
-  const pick = (n) => num(n?.price ?? n?.ask ?? n?.bid);
-  const out = {};
-  if (d.oficial) out["OFICIAL"] = { price: pick(d.oficial), changePct: num(d.oficial.variation), source: "criptoya" };
-  if (d.blue)   out["BLUE"]   = { price: pick(d.blue),    changePct: num(d.blue.variation),    source: "criptoya" };
-  const mep = d?.mep?.gd30?.ci;
-  if (mep)      out["MEP"]    = { price: num(mep.price),  changePct: num(mep.variation),       source: "criptoya" };
-  return { data: out, error: null };
+  try {
+    const res = await fetchWithTimeout(url, { headers: { accept: "application/json" } });
+    if (!res.ok) return { data: {}, error: `cy-http-${res.status}` };
+    const d = await res.json();
+    const pick = (n) => num(n?.price ?? n?.ask ?? n?.bid);
+    const out = {};
+    if (d.oficial) out["OFICIAL"] = { price: pick(d.oficial), changePct: num(d.oficial.variation), source: "criptoya" };
+    if (d.blue)   out["BLUE"]   = { price: pick(d.blue),    changePct: num(d.blue.variation),    source: "criptoya" };
+    const mep = d?.mep?.gd30?.ci;
+    if (mep)      out["MEP"]    = { price: num(mep.price),  changePct: num(mep.variation),       source: "criptoya" };
+    return { data: out, error: null };
+  } catch (e) {
+    return { data: {}, error: `cy-ex-${(e && e.name) || "err"}` };
+  }
 }
 
-// ---- Mapeo/ensamblado
 function mapItem(id, raw) {
   const meta = {
     BTC:    { label: "Bitcoin",      kind: "crypto", currency: "USD" },
@@ -134,7 +136,6 @@ function mapItem(id, raw) {
   }[id] || { label: id, kind: "stock", currency: "USD" };
 
   let changeAbs = null, changePct = null, direction = "flat";
-
   if (raw?.changePct24h != null) {
     changePct = raw.changePct24h;
   } else if (raw?.changePct != null) {
@@ -143,14 +144,12 @@ function mapItem(id, raw) {
     changeAbs = raw.price - raw.prevClose;
     changePct = (changeAbs / raw.prevClose) * 100;
   }
-
   if (changePct != null) {
     direction = changePct > 0 ? "up" : changePct < 0 ? "down" : "flat";
     if (changeAbs == null && raw?.prevClose != null) {
       changeAbs = raw.price != null ? raw.price - raw.prevClose : null;
     }
   }
-
   return {
     id,
     label: meta.label,
@@ -165,21 +164,17 @@ function mapItem(id, raw) {
   };
 }
 
-// ---- Handler (Node-style) con deadline global + snapshot
 export default async function handler(req, res) {
-  if (req.method === "OPTIONS") {
-    return sendJson(res, 200, { ok: true });
-  }
+  if (req.method === "OPTIONS") return sendJson(res, 200, { ok: true });
 
   const start = Date.now();
+  const debug = (req.url || "").includes("debug=1"); // agrega ?debug=1 a la URL para ver detalles
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const raw = (url.searchParams.get("items") || "").trim();
     if (!raw) return sendJson(res, 400, { ok: false, error: "missing items" });
 
     const ids = raw.split(",").map(s => decodeURIComponent(s.trim())).filter(Boolean);
-
-    // Clasificamos intereses por fuente
     const wantTD  = ids.filter((s) => /^[A-Z.]+$/.test(s) && !["BTC","ETH","OFICIAL","BLUE","MEP","^GSPC"].includes(s));
     const wantCG  = ids.filter((s) => s === "BTC" || s === "ETH");
     const wantCY  = ids.some((s) => s === "OFICIAL" || s === "BLUE" || s === "MEP");
@@ -187,32 +182,24 @@ export default async function handler(req, res) {
 
     const jobs = [];
     const errors = [];
+    const sources = [];
 
-    if (wantTD.length) jobs.push(fetchTwelveData(wantTD));
-    if (wantCG.length) jobs.push(fetchCoinGecko(wantCG));
-    if (wantCY)       jobs.push(fetchCriptoYa());
-    if (wantSPX)      jobs.push(fetchStooqSPX());
+    if (wantTD.length) { jobs.push(fetchTwelveData(wantTD)); sources.push({ name:"twelvedata", wants: wantTD }); }
+    if (wantCG.length) { jobs.push(fetchCoinGecko(wantCG));  sources.push({ name:"coingecko", wants: wantCG }); }
+    if (wantCY)        { jobs.push(fetchCriptoYa());         sources.push({ name:"criptoya", wants: ["OFICIAL","BLUE","MEP"] }); }
+    if (wantSPX)       { jobs.push(fetchStooqSPX());         sources.push({ name:"stooq", wants: ["^GSPC"] }); }
 
-    // Deadline global
-    const globalTimeout = new Promise((_, rej) =>
-      setTimeout(() => rej(new Error("global-deadline")), GLOBAL_DEADLINE_MS)
-    );
+    const globalTimeout = new Promise((_, rej) => setTimeout(() => rej(new Error("global-deadline")), GLOBAL_DEADLINE_MS));
 
     let merged = {};
     try {
-      const settled = await Promise.race([
-        Promise.allSettled(jobs),
-        globalTimeout,
-      ]);
-
+      const settled = await Promise.race([ Promise.allSettled(jobs), globalTimeout ]);
       if (Array.isArray(settled)) {
         for (const s of settled) {
           if (s.status === "fulfilled") {
             const { data, error } = s.value || {};
             if (error) errors.push(error);
-            if (data && typeof data === "object") {
-              merged = Object.assign(merged, data);
-            }
+            if (data && typeof data === "object") merged = Object.assign(merged, data);
           } else {
             errors.push(String(s.reason?.message || s.reason || "unknown"));
           }
@@ -227,10 +214,10 @@ export default async function handler(req, res) {
     const items = ids.map((id) => mapItem(id, merged[id] || {}));
     const hasAnyPrice = items.some((it) => it.price != null);
 
-    // Snapshot si todos fallaron
     if (!hasAnyPrice && lastGoodSnapshot) {
       const snap = { ...lastGoodSnapshot };
       snap.meta = { ...(snap.meta || {}), servedFrom: "snapshot", snapshotAt: lastGoodAt };
+      if (debug) snap.meta.sources = sources;
       return sendJson(res, 200, snap);
     }
 
@@ -239,8 +226,9 @@ export default async function handler(req, res) {
       ok: true,
       ts: Date.now(),
       items,
-      meta: { partial, stale: false, tookMs: Date.now() - start, errors },
+      meta: { partial, stale: false, tookMs: Date.now() - start, errors }
     };
+    if (debug) payload.meta.sources = sources;
 
     if (hasAnyPrice) {
       lastGoodSnapshot = payload;
