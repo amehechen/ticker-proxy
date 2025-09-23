@@ -2,16 +2,15 @@
 // Fuentes:
 // - Stocks: Twelve Data (primario) + Finnhub (fallback por símbolo)
 // - Índice S&P 500: Stooq con mirrors/símbolos alternativos + fallback a último valor bueno
-// - Cripto: CoinGecko (primario) + CoinCap (fallback), %24h
+// - Cripto: CoinGecko (primario) + CoinCap (fallback) + Binance (tercer fallback)
 // - FX ARS: CriptoYa (oficial/blue/mep)
 
 const TD_TOKEN = process.env.TWELVE_DATA_TOKEN;
 const FH_TOKEN = process.env.FINNHUB_TOKEN;
 
-// ---------- Resiliencia / caché CDN
-// (ajustado para evitar "global-deadline" cuando hay latencia)
-const PER_SOURCE_TIMEOUT_MS = 4000; // antes 3000
-const GLOBAL_DEADLINE_MS = 5500;    // antes 3500
+// ---------- Resiliencia / caché CDN (ajustado)
+const PER_SOURCE_TIMEOUT_MS = 5000; // antes 4s
+const GLOBAL_DEADLINE_MS = 8000;    // antes 5.5s
 const CDN_SMAXAGE_SEC = 5;
 const CDN_STALE_SEC = 20;
 
@@ -131,18 +130,18 @@ async function fetchStooqSPXRobust() {
   return { data: {}, error: "stooq-all-attempts-failed" };
 }
 
-// CoinGecko (primario) → CoinCap (fallback) para BTC/ETH
+// Crypto: CoinGecko → CoinCap → Binance (24h change de /24hr)
 async function fetchCryptoWithFallback(ids) {
   const out = {};
   const errs = [];
 
-  // 1) CoinGecko
-  const cgNeed = [];
-  if (ids.includes("BTC")) cgNeed.push("bitcoin");
-  if (ids.includes("ETH")) cgNeed.push("ethereum");
+  // --- CoinGecko (primario)
+  const cgIds = [];
+  if (ids.includes("BTC")) cgIds.push("bitcoin");
+  if (ids.includes("ETH")) cgIds.push("ethereum");
 
-  if (cgNeed.length) {
-    const cgUrl = `https://api.coingecko.com/api/v3/simple/price?ids=${cgNeed.join(",")}&vs_currencies=usd&include_24hr_change=true`;
+  if (cgIds.length) {
+    const cgUrl = `https://api.coingecko.com/api/v3/simple/price?ids=${cgIds.join(",")}&vs_currencies=usd&include_24hr_change=true`;
     try {
       const res = await fetchWithTimeout(cgUrl, { headers: { accept: "application/json" } });
       if (res.ok) {
@@ -157,14 +156,11 @@ async function fetchCryptoWithFallback(ids) {
     }
   }
 
-  // 2) Si faltó algo o CG dio 429/err → CoinCap
-  const needFallback = ids.filter((id) => !out[id]);
-  if (needFallback.length) {
+  // --- CoinCap (fallback)
+  const needCC = ids.filter((id) => !out[id]);
+  if (needCC.length) {
     try {
-      const ccIds = needFallback
-        .map(x => x === "BTC" ? "bitcoin" : x === "ETH" ? "ethereum" : "")
-        .filter(Boolean)
-        .join(",");
+      const ccIds = needCC.map(x => x === "BTC" ? "bitcoin" : x === "ETH" ? "ethereum" : "").filter(Boolean).join(",");
       if (ccIds) {
         const ccUrl = `https://api.coincap.io/v2/assets?ids=${ccIds}`;
         const res = await fetchWithTimeout(ccUrl, { headers: { accept: "application/json" } });
@@ -190,6 +186,44 @@ async function fetchCryptoWithFallback(ids) {
       }
     } catch (e) {
       errs.push(`coincap-ex-${(e && e.name) || "err"}`);
+    }
+  }
+
+  // --- Binance (tercer fallback)
+  const needBN = ids.filter((id) => !out[id]);
+  if (needBN.length) {
+    try {
+      // price
+      const priceUrls = [];
+      if (needBN.includes("BTC")) priceUrls.push(["BTC","https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"]);
+      if (needBN.includes("ETH")) priceUrls.push(["ETH","https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT"]);
+      const prices = await Promise.all(priceUrls.map(async ([id, url]) => {
+        try { const r = await fetchWithTimeout(url, { headers: { accept: "application/json" } }); return [id, r.ok ? await r.json() : null]; }
+        catch { return [id, null]; }
+      }));
+      // 24hr
+      const chUrls = [];
+      if (needBN.includes("BTC")) chUrls.push(["BTC","https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT"]);
+      if (needBN.includes("ETH")) chUrls.push(["ETH","https://api.binance.com/api/v3/ticker/24hr?symbol=ETHUSDT"]);
+      const chs = await Promise.all(chUrls.map(async ([id, url]) => {
+        try { const r = await fetchWithTimeout(url, { headers: { accept: "application/json" } }); return [id, r.ok ? await r.json() : null]; }
+        catch { return [id, null]; }
+      }));
+      const priceMap = Object.fromEntries(prices);
+      const chMap = Object.fromEntries(chs);
+
+      for (const id of needBN) {
+        const p = priceMap[id];
+        if (p?.price) {
+          const price = num(p.price);
+          let pct = null;
+          const c = chMap[id];
+          if (c?.priceChangePercent != null) pct = num(c.priceChangePercent);
+          if (price != null) out[id] = { price, changePct24h: pct, source: "binance" };
+        }
+      }
+    } catch (e) {
+      errs.push(`binance-ex-${(e && e.name) || "err"}`);
     }
   }
 
@@ -284,10 +318,18 @@ export default async function handler(req, res) {
     const errors = [];
     const sources = [];
 
+    // ⚠️ Pre-sembrar merged con último valor bueno por ID
+    let merged = {};
+    for (const id of ids) {
+      if (lastGoodById[id]?.price != null) {
+        merged[id] = { ...lastGoodById[id], source: "snapshot-id" };
+      }
+    }
+
     // Stocks: TwelveData primero
     if (wantStocks.length) { jobs.push(fetchTwelveData(wantStocks)); sources.push({ name:"twelvedata", wants: wantStocks }); }
-    // Crypto: CG + fallback CoinCap
-    if (wantCrypto.length) { jobs.push(fetchCryptoWithFallback(wantCrypto)); sources.push({ name:"coingecko/coinCap", wants: wantCrypto }); }
+    // Crypto: CG + CoinCap + Binance
+    if (wantCrypto.length) { jobs.push(fetchCryptoWithFallback(wantCrypto)); sources.push({ name:"coingecko/coincap/binance", wants: wantCrypto }); }
     // FX ARS
     if (wantFX) { jobs.push(fetchCriptoYa()); sources.push({ name:"criptoya", wants: ["OFICIAL","BLUE","MEP"] }); }
     // S&P 500
@@ -295,7 +337,6 @@ export default async function handler(req, res) {
 
     const deadline = new Promise((_, rej) => setTimeout(() => rej(new Error("global-deadline")), GLOBAL_DEADLINE_MS));
 
-    let merged = {};
     try {
       const settled = await Promise.race([ Promise.allSettled(jobs), deadline ]);
       if (Array.isArray(settled)) {
@@ -324,12 +365,10 @@ export default async function handler(req, res) {
       sources.push({ name: "finnhub-fallback", wants: missingStockIds });
     }
 
-    // Reusar último valor bueno por ID si todavía falta alguno
-    for (const id of ids) {
-      if (!merged[id]?.price && lastGoodById[id]?.price != null) {
-        merged[id] = { ...lastGoodById[id], source: merged[id]?.source || "snapshot-id" };
-        errors.push(`used-last-good:${id}`);
-      }
+    // Si ^GSPC sigue sin precio, usar último bueno por ese ID
+    if (wantSPX && !merged["^GSPC"]?.price && lastGoodById["^GSPC"]?.price != null) {
+      merged["^GSPC"] = { ...lastGoodById["^GSPC"], source: merged["^GSPC"]?.source || "snapshot-id" };
+      errors.push("spx-used-last-good");
     }
 
     const items = ids.map((id) => mapItem(id, merged[id] || {}));
