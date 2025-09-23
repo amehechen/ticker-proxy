@@ -9,8 +9,8 @@ const TD_TOKEN = process.env.TWELVE_DATA_TOKEN;
 const FH_TOKEN = process.env.FINNHUB_TOKEN;
 
 // ---------- Resiliencia / caché CDN
-const PER_SOURCE_TIMEOUT_MS = 3000;
-const GLOBAL_DEADLINE_MS = 3500;
+const PER_SOURCE_TIMEOUT_MS = 4000;
+const GLOBAL_DEADLINE_MS = 5500;
 const CDN_SMAXAGE_SEC = 5;
 const CDN_STALE_SEC = 20;
 
